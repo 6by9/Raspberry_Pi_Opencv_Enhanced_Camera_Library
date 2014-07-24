@@ -62,9 +62,8 @@ VCOS_LOG_CAT_T raspitex_log_category = VCOS_LOG_INIT("RaspiCV", VCOS_LOG_TRACE);
 #define CAMERA_NUMBER 0
 
 // Standard port setting for the camera component
-//#define MMAL_CAMERA_PREVIEW_PORT 0
-#define MMAL_CAMERA_VIDEO_PORT 0
-#define MMAL_CAMERA_VIDEO_PORT_2 1
+#define MMAL_CAMERA_PREVIEW_PORT 0
+#define MMAL_CAMERA_VIDEO_PORT 1
 //#define MMAL_CAMERA_CAPTURE_PORT 2
 
 // Video format information
@@ -130,8 +129,8 @@ typedef struct _RASPIVID_STATE
 	MMAL_CONNECTION_T *preview_connection; /// Pointer to the connection from camera to preview
 	MMAL_CONNECTION_T *encoder_connection; /// Pointer to the connection from camera to encoder
 
+	MMAL_POOL_T *preview_pool; /// Pointer to the pool of buffers used by encoder output port
 	MMAL_POOL_T *video_pool; /// Pointer to the pool of buffers used by encoder output port
-	MMAL_POOL_T *video_pool2; /// Pointer to the pool of buffers used by encoder output port
 	MMAL_POOL_T *encoder_pool; /// Pointer to the pool of buffers used by encoder output port
 
 	PORT_USERDATA callback_data;		  /// Used to move data to the encoder callback
@@ -210,7 +209,12 @@ static FILE *open_filename(RASPIVID_STATE *pState)
 	}
 
 	if (filename)
+	{
 		new_handle = fopen(filename, "wb");
+		vcos_log_error("opened file %s, returned fd %d", filename, new_handle);
+	}
+	else
+		vcos_log_error("no filename");
 
 	if (tempname)
 		free(tempname);
@@ -259,7 +263,7 @@ static FILE *open_imv_filename(RASPIVID_STATE *pState)
  
  int counter = 0;
  
-static void video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+static void preview_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
 	MMAL_BUFFER_HEADER_T *new_buffer;
 	RASPIVID_STATE * state = (RASPIVID_STATE *)port->userdata;
@@ -268,6 +272,7 @@ static void video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffe
 
 	if (state)
 	{
+vcos_log_error("%s: Buffer rxd. Len %d, alloc_size %d, flags %d", __func__, buffer->length, buffer->alloc_size, buffer->flags);
 		if (state->finished) {
 			vcos_semaphore_post(&state->capture_done_sem);
 			return;
@@ -320,7 +325,7 @@ static void video_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffe
 	{
 		MMAL_STATUS_T status;
 
-		new_buffer = mmal_queue_get(state->video_pool->queue);
+		new_buffer = mmal_queue_get(state->preview_pool->queue);
 
 		if (new_buffer)
 			status = mmal_port_send_buffer(port, new_buffer);
@@ -343,9 +348,8 @@ static MMAL_COMPONENT_T *create_camera_component(RASPIVID_STATE *state)
 {
 	MMAL_COMPONENT_T *camera = 0;
 	MMAL_ES_FORMAT_T *format;
-	//MMAL_PORT_T *preview_port = NULL;
+	MMAL_PORT_T *preview_port = NULL;
 	MMAL_PORT_T *video_port = NULL;
-	MMAL_PORT_T *video_port2 = NULL;
 	//MMAL_PORT_T *still_port = NULL;
 	MMAL_STATUS_T status;
 
@@ -365,8 +369,15 @@ static MMAL_COMPONENT_T *create_camera_component(RASPIVID_STATE *state)
 		goto error;
 	}
 
+	status = mmal_component_enable(camera);
+	if (status)
+	{
+		vcos_log_error("error enabling camera component - status %d", status);
+		goto error;
+	}
+
+	preview_port = camera->output[MMAL_CAMERA_PREVIEW_PORT];
 	video_port = camera->output[MMAL_CAMERA_VIDEO_PORT];
-	video_port2 = camera->output[MMAL_CAMERA_VIDEO_PORT_2];
 	//still_port = camera->output[MMAL_CAMERA_CAPTURE_PORT];
 
 	//  set up the camera configuration
@@ -390,9 +401,29 @@ static MMAL_COMPONENT_T *create_camera_component(RASPIVID_STATE *state)
 	// Set the encode format on the video  port
 
 	//printf("point1.1\n");
-	format = video_port->format;
+	format = preview_port->format;
 	format->encoding_variant = MMAL_ENCODING_I420;
 	format->encoding = MMAL_ENCODING_I420;
+	format->es->video.width = state->width;
+	format->es->video.height = state->height;
+	format->es->video.crop.x = 0;
+	format->es->video.crop.y = 0;
+	format->es->video.crop.width = state->width;
+	format->es->video.crop.height = state->height;
+	format->es->video.frame_rate.num = state->framerate;
+	format->es->video.frame_rate.den = VIDEO_FRAME_RATE_DEN;
+
+	status = mmal_port_format_commit(preview_port);
+	if (status)
+	{
+		vcos_log_error("camera video format couldn't be set");
+		goto error;
+	}
+
+	//printf("point1.11\n");
+	format = video_port->format;
+	format->encoding_variant = MMAL_ENCODING_I420;
+	format->encoding = MMAL_ENCODING_OPAQUE;
 	format->es->video.width = state->width;
 	format->es->video.height = state->height;
 	format->es->video.crop.x = 0;
@@ -408,45 +439,26 @@ static MMAL_COMPONENT_T *create_camera_component(RASPIVID_STATE *state)
 		vcos_log_error("camera video format couldn't be set");
 		goto error;
 	}
-
-	//printf("point1.11\n");
-	format = video_port2->format;
-	format->encoding_variant = MMAL_ENCODING_I420;
-	format->encoding = MMAL_ENCODING_OPAQUE;
-	format->es->video.width = state->width;
-	format->es->video.height = state->height;
-	format->es->video.crop.x = 0;
-	format->es->video.crop.y = 0;
-	format->es->video.crop.width = state->width;
-	format->es->video.crop.height = state->height;
-	format->es->video.frame_rate.num = state->framerate;
-	format->es->video.frame_rate.den = VIDEO_FRAME_RATE_DEN;
-
-	status = mmal_port_format_commit(video_port2);
-	if (status)
-	{
-		vcos_log_error("camera video format couldn't be set");
-		goto error;
-	}
 	//mmal_port_format_copy(video_port, video_port2);
 	//printf("point1.2\n");
 
+	preview_port->buffer_size = preview_port->buffer_size_recommended;
+	preview_port->buffer_num = preview_port->buffer_num_recommended;
+	// Ensure there are enough buffers to avoid dropping frames
+	if (preview_port->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
+		preview_port->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
+
+	// Ensure there are enough buffers to avoid dropping frames
+	if (video_port->buffer_num < video_port->buffer_num_recommended)
+		video_port->buffer_num = video_port->buffer_num_recommended;
+
 	// PR : plug the callback to the video port 
-	status = mmal_port_enable(video_port, video_buffer_callback);
+	status = mmal_port_enable(preview_port, preview_buffer_callback);
 	if (status)
 	{
 		vcos_log_error("camera video callback2 error");
 		goto error;
 	}
-
-	// Ensure there are enough buffers to avoid dropping frames
-	if (video_port->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
-		video_port->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
-
-	// Ensure there are enough buffers to avoid dropping frames
-	if (video_port2->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
-		video_port2->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
-
 
 	//printf("point1.3\n");
 	/*// Set the encode format on the still  port
@@ -472,28 +484,21 @@ static MMAL_COMPONENT_T *create_camera_component(RASPIVID_STATE *state)
 
 	//PR : create pool of message on video port
 	MMAL_POOL_T *pool;
-	video_port->buffer_size = video_port->buffer_size_recommended;
-	video_port->buffer_num = video_port->buffer_num_recommended;
-	pool = mmal_port_pool_create(video_port, video_port->buffer_num, video_port->buffer_size);
+	pool = mmal_port_pool_create(preview_port, preview_port->buffer_num, preview_port->buffer_size);
 	if (!pool)
 	{
-		vcos_log_error("Failed to create buffer header pool for video output port");
+		vcos_log_error("Failed to create buffer header pool for preview output port");
 	}
 	//printf("point1.4\n");
-	state->video_pool = pool;
+	state->preview_pool = pool;
 	
 	
 	//PR : create pool of message on video port
 	MMAL_POOL_T *pool2;
-	video_port2->buffer_size = video_port2->buffer_size_recommended;
-	video_port2->buffer_num = video_port2->buffer_num_recommended;
-	pool2 = mmal_port_pool_create(video_port2, video_port2->buffer_num, video_port2->buffer_size);
-	if (!pool)
-	{
-		vcos_log_error("Failed to create buffer header pool for video output port");
-	}
+	video_port->buffer_size = video_port->buffer_size_recommended;
+	video_port->buffer_num = video_port->buffer_num_recommended;
 	//printf("point1.4\n");
-	state->video_pool2 = pool2;
+	state->video_pool = pool2;
 
 	/*// Ensure there are enough buffers to avoid dropping frames
 	if (still_port->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
@@ -501,7 +506,6 @@ static MMAL_COMPONENT_T *create_camera_component(RASPIVID_STATE *state)
 
 	/* Enable component */
 	//printf("point1.5\n");
-	status = mmal_component_enable(camera);
 	//printf("point1.6\n");
 
 	if (status)
@@ -552,7 +556,7 @@ static void destroy_camera_component(RASPIVID_STATE *state)
  */
 static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
-	printf("Called...");
+	vcos_log_error("%s: buffer length %d, alloc_size %d, flags %04X", __func__, buffer->length, buffer->alloc_size, buffer->flags);
 	MMAL_BUFFER_HEADER_T *new_buffer;
 	static int64_t base_time =  -1;
 
@@ -863,9 +867,9 @@ static MMAL_STATUS_T create_encoder_component(RASPIVID_STATE *state)
 static void destroy_encoder_component(RASPIVID_STATE *state)
 {
 	// Get rid of any port buffers first
-	if (state->video_pool)
+	if (state->preview_pool)
 	{
-		mmal_port_pool_destroy(state->encoder_component->output[0], state->video_pool);
+		mmal_port_pool_destroy(state->encoder_component->output[0], state->preview_pool);
 	}
 
 	if (state->encoder_component)
@@ -894,7 +898,10 @@ static MMAL_STATUS_T connect_ports(MMAL_PORT_T *output_port, MMAL_PORT_T *input_
 	{
 		status =  mmal_connection_enable(*connection);
 		if (status != MMAL_SUCCESS)
+		{
+			vcos_log_error("Failed to connect ports %s and %s - status %d", output_port->name, input_port->name);
 			mmal_connection_destroy(*connection);
+		}
 	}
 
 	return status;
@@ -920,8 +927,8 @@ RaspiCamCvCapture * raspiCamCvCreateCameraCapture(int index)
 	capture->pState = state;
 
 	MMAL_STATUS_T status = -1;
+	MMAL_PORT_T *camera_preview_port = NULL;
 	MMAL_PORT_T *camera_video_port = NULL;
-	MMAL_PORT_T *camera_video_port_2 = NULL;
 	//MMAL_PORT_T *camera_still_port = NULL;
 	MMAL_PORT_T *encoder_input_port = NULL;
 	MMAL_PORT_T *encoder_output_port = NULL;
@@ -965,20 +972,20 @@ RaspiCamCvCapture * raspiCamCvCreateCameraCapture(int index)
 	//printf("point2.1\n");
 	//create_encoder_component(state);
 
+	camera_preview_port = state->camera_component->output[MMAL_CAMERA_PREVIEW_PORT];
 	camera_video_port = state->camera_component->output[MMAL_CAMERA_VIDEO_PORT];
-	camera_video_port_2 = state->camera_component->output[MMAL_CAMERA_VIDEO_PORT_2];
 	//camera_still_port = state->camera_component->output[MMAL_CAMERA_CAPTURE_PORT];
 	encoder_input_port  = state->encoder_component->input[0];
 	encoder_output_port = state->encoder_component->output[0];
 
 	// assign data to use for callback
-	camera_video_port->userdata = (struct MMAL_PORT_USERDATA_T *)state;
+	camera_preview_port->userdata = (struct MMAL_PORT_USERDATA_T *)state;
 
 	// assign data to use for callback
-	camera_video_port_2->userdata = (struct MMAL_PORT_USERDATA_T *)state;
-
+	camera_video_port->userdata = (struct MMAL_PORT_USERDATA_T *)state;
+vcos_log_error("Connecting ports now");
 	// Now connect the camera to the encoder
-	status = connect_ports(camera_video_port_2, encoder_input_port, &state->encoder_connection);	
+	status = connect_ports(camera_video_port, encoder_input_port, &state->encoder_connection);	
 	
 	if (state->filename)
 	{
@@ -1046,25 +1053,25 @@ RaspiCamCvCapture * raspiCamCvCreateCameraCapture(int index)
 
 
 	// start capture
-	if (mmal_port_parameter_set_boolean(camera_video_port_2, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS)
+	if (mmal_port_parameter_set_boolean(camera_video_port, MMAL_PARAMETER_CAPTURE, 1) != MMAL_SUCCESS)
 	{
 		vcos_log_error("%s: Failed to start capture", __func__);
 		raspiCamCvReleaseCapture(&capture);
 		return NULL;
 	}
 
-	// Send all the buffers to the video port
+	// Send all the buffers to the preview port
 
-	int num = mmal_queue_length(state->video_pool->queue);
+	int num = mmal_queue_length(state->preview_pool->queue);
 	int q;
 	for (q = 0; q < num; q++)
 	{
-		MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state->video_pool->queue);
+		MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(state->preview_pool->queue);
 
 		if (!buffer)
 			vcos_log_error("Unable to get a required buffer %d from pool queue", q);
 
-		if (mmal_port_send_buffer(camera_video_port, buffer)!= MMAL_SUCCESS)
+		if (mmal_port_send_buffer(camera_preview_port, buffer)!= MMAL_SUCCESS)
 			vcos_log_error("Unable to send a buffer to encoder output port (%d)", q);
 	}
 
